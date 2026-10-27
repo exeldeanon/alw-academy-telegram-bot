@@ -60,7 +60,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/users.db")
 SITE_URL = os.getenv("SITE_URL", "https://alwacademy.ru")
 CHECKLIST_URL = os.getenv("CHECKLIST_URL", "https://alwacademy.ru/articles/test-1792970529333?key=3YbR8qAzsv7XOE1g5HDvOOWVDhxcdE_D")
 
-FOLLOWUP_DELAY_SECONDS = 15 * 60
+FOLLOWUP_DELAYS_SECONDS = (15 * 60, 24 * 60 * 60, 24 * 60 * 60)
 BROADCAST_DELAY_SECONDS = 0.05
 
 
@@ -93,11 +93,29 @@ CHECKLIST_CAPTION = """Держи 👇
 
 Банки и условия — на нас. А как попасть в команду, которая ведёт за руку до дохода, — рассказываю в канале."""
 
-FOLLOWUP_TEXT = """⚡️ <b>Кстати, важный момент!</b>
+FOLLOWUP_TEXT_1 = """⚡️ <b>Кстати, важный момент!</b>
 
 На этой неделе наши кураторы проводят бесплатные 10-минутные разборы для новичков: показывают актуальные ставки по банкам (РКО и карты) и помогают составить личный план выхода на первые выплаты.
 
 Мест на разбор немного. Забронировать бесплатный слот можно на сайте ALW Academy или написать напрямую @ALWAcademy."""
+
+FOLLOWUP_TEXT_2 = """👀 <b>Чек-лист ещё не открыл?</b>
+
+Там одна цифра, которая меняет взгляд на нишу: <b>43 925 ₽ с одного клиента только на банках.</b>
+
+Открой материал на сайте, пока он не утонул в чатах 👇"""
+
+FOLLOWUP_TEXT_3 = """🔥 <b>Раз ты уже зарабатываешь — посмотри на это как на второй поток.</b>
+
+Один человек — до 43 925 ₽ только с банков. 2–3 таких клиента в месяц — это уже +100К к тому, что у тебя есть.
+
+Это не вторая работа: банки, условия и готовые связки уже собраны на сайте ALW Academy."""
+
+FOLLOWUP_INTEREST_TEXT = """Принял 🙌 Передал команде — с тобой свяжутся в ближайшее время.
+
+Чтобы разговор был предметнее, напиши одним сообщением: сколько времени в день готов уделять и есть ли уже люди на примете.
+
+Подробности и запись на сайте ALW Academy 👇"""
 
 
 async def site_url() -> str:
@@ -144,8 +162,22 @@ def checklist_keyboard(url: str = "") -> InlineKeyboardMarkup:
     )
 
 
-async def followup_keyboard() -> InlineKeyboardMarkup:
+async def followup_keyboard(step: int = 1) -> InlineKeyboardMarkup:
     site = await site_url()
+    if step == 3:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔥 Хочу в команду", callback_data="followup_interest")],
+                [InlineKeyboardButton(text="🌐 Открыть сайт ALW Academy", url=site)],
+            ]
+        )
+    if step == 2:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📖 Открыть материал", url=await content_value("checklist_url", CHECKLIST_URL))],
+                [InlineKeyboardButton(text="📞 Записаться на разбор", url=f"{site}/calls")],
+            ]
+        )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Записаться на бесплатный разбор", url=f"{site}/calls")],
@@ -201,6 +233,12 @@ class Database:
         for column, definition in migrations.items():
             if column not in existing_columns:
                 await self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
+        followup_columns = {
+            row[1]
+            for row in await (await self.conn.execute("PRAGMA table_info(followups)")).fetchall()
+        }
+        if "step" not in followup_columns:
+            await self.conn.execute("ALTER TABLE followups ADD COLUMN step INTEGER NOT NULL DEFAULT 1")
         await self.conn.execute(
             "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
         )
@@ -380,27 +418,35 @@ class Database:
         cursor = await self.conn.execute("SELECT user_id FROM users ORDER BY user_id")
         return [int(row[0]) for row in await cursor.fetchall()]
 
-    async def save_followup(self, user_id: int, due_at: float) -> float | None:
+    async def save_followup(self, user_id: int, due_at: float, step: int = 1) -> float | None:
         assert self.conn is not None
         await self.conn.execute(
-            """INSERT INTO followups(user_id, due_at, sent) VALUES (?, ?, 0)
+            """INSERT INTO followups(user_id, due_at, step, sent) VALUES (?, ?, ?, 0)
                ON CONFLICT(user_id) DO NOTHING""",
-            (user_id, due_at),
+            (user_id, due_at, step),
         )
         await self.conn.commit()
         async with self.conn.execute("SELECT due_at,sent FROM followups WHERE user_id=?", (user_id,)) as cursor:
             row = await cursor.fetchone()
         return float(row[0]) if row and not row[1] else None
 
+    async def advance_followup(self, user_id: int, due_at: float, step: int) -> None:
+        assert self.conn is not None
+        await self.conn.execute(
+            "UPDATE followups SET due_at=?, step=?, sent=0 WHERE user_id=?",
+            (due_at, step, user_id),
+        )
+        await self.conn.commit()
+
     async def mark_followup_sent(self, user_id: int) -> None:
         assert self.conn is not None
         await self.conn.execute("UPDATE followups SET sent=1 WHERE user_id=?", (user_id,))
         await self.conn.commit()
 
-    async def pending_followups(self) -> list[tuple[int, float]]:
+    async def pending_followups(self) -> list[tuple[int, float, int]]:
         assert self.conn is not None
-        cursor = await self.conn.execute("SELECT user_id, due_at FROM followups WHERE sent=0")
-        return [(int(row[0]), float(row[1])) for row in await cursor.fetchall()]
+        cursor = await self.conn.execute("SELECT user_id, due_at, step FROM followups WHERE sent=0")
+        return [(int(row[0]), float(row[1]), int(row[2])) for row in await cursor.fetchall()]
 
 
 db = Database(DB_PATH)
@@ -444,6 +490,14 @@ async def content_value(key: str, fallback: str) -> str:
     return value if value is not None else fallback
 
 
+async def followup_text(step: int) -> str:
+    defaults = {1: FOLLOWUP_TEXT_1, 2: FOLLOWUP_TEXT_2, 3: FOLLOWUP_TEXT_3}
+    value = await db.get_setting(f"followup_text_{step}")
+    if value is None and step == 1:
+        value = await db.get_setting("followup_text")
+    return value if value is not None else defaults[step]
+
+
 async def send_welcome(bot: Bot, chat_id: int, user: Any) -> Message:
     template = await content_value("welcome_text", WELCOME_TEXT_APPROVED)
     text = template.format(name=display_name(user))
@@ -470,13 +524,20 @@ async def send_checklist(bot: Bot, user_id: int) -> None:
     await schedule_followup(bot, user_id)
 
 
-async def followup_worker(bot: Bot, user_id: int, due_at: float) -> None:
+async def followup_worker(bot: Bot, user_id: int, due_at: float, step: int = 1) -> None:
     try:
         await asyncio.sleep(max(0.0, due_at - datetime.now(timezone.utc).timestamp()))
-        text = await content_value("followup_text", FOLLOWUP_TEXT)
-        await bot.send_message(user_id, text, reply_markup=await followup_keyboard())
+        text = await followup_text(step)
+        await bot.send_message(user_id, text, reply_markup=await followup_keyboard(step))
         await db.mark_followup_sent(user_id)
-        logger.info("Follow-up sent to %s", user_id)
+        logger.info("Follow-up step %s sent to %s", step, user_id)
+        if step < len(FOLLOWUP_DELAYS_SECONDS):
+            next_step = step + 1
+            next_due_at = datetime.now(timezone.utc).timestamp() + FOLLOWUP_DELAYS_SECONDS[step]
+            await db.advance_followup(user_id, next_due_at, next_step)
+            followup_tasks[user_id] = asyncio.create_task(
+                followup_worker(bot, user_id, next_due_at, next_step)
+            )
     except TelegramForbiddenError:
         await db.mark_blocked(user_id)
         await db.mark_followup_sent(user_id)
@@ -493,14 +554,14 @@ async def followup_worker(bot: Bot, user_id: int, due_at: float) -> None:
 
 
 async def schedule_followup(bot: Bot, user_id: int) -> None:
-    due_at = datetime.now(timezone.utc).timestamp() + FOLLOWUP_DELAY_SECONDS
-    saved_due_at = await db.save_followup(user_id, due_at)
+    due_at = datetime.now(timezone.utc).timestamp() + FOLLOWUP_DELAYS_SECONDS[0]
+    saved_due_at = await db.save_followup(user_id, due_at, 1)
     if saved_due_at is None:
         return
     old_task = followup_tasks.get(user_id)
     if old_task and not old_task.done():
         return
-    followup_tasks[user_id] = asyncio.create_task(followup_worker(bot, user_id, saved_due_at))
+    followup_tasks[user_id] = asyncio.create_task(followup_worker(bot, user_id, saved_due_at, 1))
 
 
 class BroadcastState(StatesGroup):
@@ -528,7 +589,11 @@ CONTENT_FIELDS = {
     "welcome": ("welcome_text", "приветственное сообщение после одобрения заявки", WELCOME_TEXT_APPROVED),
     "checklist": ("checklist_caption", "текст перед ссылкой на материал", CHECKLIST_CAPTION),
     "checklist_url": ("checklist_url", "ссылка на материал-лидмагнит", CHECKLIST_URL),
-    "followup": ("followup_text", "сообщение через 15 минут", FOLLOWUP_TEXT),
+    "followup": ("followup_text_1", "первое сообщение дожима через 15 минут", FOLLOWUP_TEXT_1),
+    "followup_1": ("followup_text_1", "первое сообщение дожима через 15 минут", FOLLOWUP_TEXT_1),
+    "followup_2": ("followup_text_2", "второе сообщение дожима на следующий день", FOLLOWUP_TEXT_2),
+    "followup_3": ("followup_text_3", "третье сообщение дожима на следующий день", FOLLOWUP_TEXT_3),
+    "followup_interest": ("followup_interest_text", "ответ после кнопки Хочу в команду", FOLLOWUP_INTEREST_TEXT),
     "question_1": ("question_1_text", "первый вопрос анкеты", QUESTION_1_TEXT),
     "question_2": ("question_2_text", "второй вопрос анкеты", QUESTION_2_TEXT),
     "site": ("site_url", "ссылка на сайт", SITE_URL),
@@ -668,6 +733,26 @@ async def handle_checklist_read(callback: CallbackQuery) -> None:
     await callback.answer("Отлично ✅")
 
 
+@router.callback_query(F.data == "followup_interest")
+async def handle_followup_interest(callback: CallbackQuery, bot: Bot) -> None:
+    await db.record_button_click(callback.from_user.id, "followup_interest")
+    await callback.answer("Передал команде ✅")
+    try:
+        text = await content_value("followup_interest_text", FOLLOWUP_INTEREST_TEXT)
+        site = await site_url()
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📞 Записаться на созвон", url=f"{site}/calls")],
+                [InlineKeyboardButton(text="🌐 Открыть сайт ALW Academy", url=site)],
+            ]
+        )
+        await bot.send_message(callback.from_user.id, text, reply_markup=keyboard)
+    except TelegramForbiddenError:
+        await db.mark_blocked(callback.from_user.id)
+    except TelegramAPIError:
+        logger.exception("Could not send follow-up interest response to %s", callback.from_user.id)
+
+
 @router.callback_query(F.data == "get_lead_magnet")
 async def handle_legacy_lead_button(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     """Keep old welcome messages usable while users transition to the quiz."""
@@ -700,6 +785,7 @@ BUTTON_LABELS = {
     "q2_heard": "Вопрос 2: слышал, но не разбирался",
     "q2_no": "Вопрос 2: впервые слышу",
     "checklist_read": "Прочитал(а) чек-лист",
+    "followup_interest": "Хочу в команду",
     "get_lead_magnet": "Старый лид-магнит",
 }
 
@@ -845,7 +931,7 @@ async def handle_content(message: Message) -> None:
         current = await content_value(key, fallback)
         preview = " ".join(current.replace("\n", " ").split())[:140]
         lines.append(f"<b>{alias}</b> — {label}: {html.escape(preview)}")
-    lines.append("\nКлючи: welcome, checklist, checklist_url, followup, question_1, question_2, site")
+    lines.append("\nКлючи: welcome, checklist, checklist_url, followup_1, followup_2, followup_3, followup_interest, question_1, question_2, site")
     lines.append("Для возврата к исходному тексту: /reset_content <ключ>")
     await message.answer("\n".join(lines))
 
@@ -857,7 +943,7 @@ async def handle_set_content(message: Message, state: FSMContext) -> None:
     parts = (message.text or "").split(maxsplit=1)
     alias = parts[1].strip().lower() if len(parts) > 1 else ""
     if alias not in CONTENT_FIELDS:
-        await message.answer("Использование: /set_content welcome|checklist|checklist_url|followup|question_1|question_2|site")
+        await message.answer("Использование: /set_content welcome|checklist|checklist_url|followup_1|followup_2|followup_3|followup_interest|question_1|question_2|site")
         return
     await state.set_state(ContentState.waiting_for_value)
     await state.update_data(content_alias=alias)
@@ -871,7 +957,7 @@ async def handle_reset_content(message: Message, state: FSMContext) -> None:
     parts = (message.text or "").split(maxsplit=1)
     alias = parts[1].strip().lower() if len(parts) > 1 else ""
     if alias not in CONTENT_FIELDS:
-        await message.answer("Укажи ключ: welcome, checklist, checklist_url, followup, question_1, question_2 или site.")
+        await message.answer("Укажи ключ: welcome, checklist, checklist_url, followup_1, followup_2, followup_3, followup_interest, question_1, question_2 или site.")
         return
     key = CONTENT_FIELDS[alias][0]
     await db.delete_setting(key)
@@ -945,8 +1031,8 @@ async def main() -> None:
     dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(router)
 
-    for user_id, due_at in await db.pending_followups():
-        followup_tasks[user_id] = asyncio.create_task(followup_worker(bot, user_id, due_at))
+    for user_id, due_at, step in await db.pending_followups():
+        followup_tasks[user_id] = asyncio.create_task(followup_worker(bot, user_id, due_at, step))
 
     logger.info("ALW Academy bot started")
     try:
