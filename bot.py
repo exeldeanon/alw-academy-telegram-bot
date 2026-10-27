@@ -91,7 +91,7 @@ CHECKLIST_CAPTION = """Держи 👇
 
 Главное, что стоит запомнить: 100 000 ₽ — это 2–3 человека в месяц, не сотня.
 
-Банки и условия — на нас. А как попасть в команду, которая ведёт за руку до дохода, — рассказываю в канале."""
+Банки и условия — на нас. А как стать учеником ALW Academy и пройти путь до первых выплат — рассказываю на сайте."""
 
 FOLLOWUP_TEXT_1 = """⚡️ <b>Кстати, важный момент!</b>
 
@@ -111,7 +111,7 @@ FOLLOWUP_TEXT_3 = """🔥 <b>Раз ты уже зарабатываешь — �
 
 Это не вторая работа: банки, условия и готовые связки уже собраны на сайте ALW Academy."""
 
-FOLLOWUP_INTEREST_TEXT = """Принял 🙌 Передал команде — с тобой свяжутся в ближайшее время.
+FOLLOWUP_INTEREST_TEXT = """Отлично 🙌 Заявку на обучение получил — с тобой свяжутся в ближайшее время.
 
 Чтобы разговор был предметнее, напиши одним сообщением: сколько времени в день готов уделять и есть ли уже люди на примете.
 
@@ -167,7 +167,7 @@ async def followup_keyboard(step: int = 1) -> InlineKeyboardMarkup:
     if step == 3:
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🔥 Хочу в команду", callback_data="followup_interest")],
+                [InlineKeyboardButton(text="🎓 Стать учеником", callback_data="followup_interest")],
                 [InlineKeyboardButton(text="🌐 Открыть сайт ALW Academy", url=site)],
             ]
         )
@@ -593,7 +593,7 @@ CONTENT_FIELDS = {
     "followup_1": ("followup_text_1", "первое сообщение дожима через 15 минут", FOLLOWUP_TEXT_1),
     "followup_2": ("followup_text_2", "второе сообщение дожима на следующий день", FOLLOWUP_TEXT_2),
     "followup_3": ("followup_text_3", "третье сообщение дожима на следующий день", FOLLOWUP_TEXT_3),
-    "followup_interest": ("followup_interest_text", "ответ после кнопки Хочу в команду", FOLLOWUP_INTEREST_TEXT),
+    "followup_interest": ("followup_interest_text", "ответ после кнопки Стать учеником", FOLLOWUP_INTEREST_TEXT),
     "question_1": ("question_1_text", "первый вопрос анкеты", QUESTION_1_TEXT),
     "question_2": ("question_2_text", "второй вопрос анкеты", QUESTION_2_TEXT),
     "site": ("site_url", "ссылка на сайт", SITE_URL),
@@ -736,7 +736,7 @@ async def handle_checklist_read(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "followup_interest")
 async def handle_followup_interest(callback: CallbackQuery, bot: Bot) -> None:
     await db.record_button_click(callback.from_user.id, "followup_interest")
-    await callback.answer("Передал команде ✅")
+    await callback.answer("Заявка на обучение принята ✅")
     try:
         text = await content_value("followup_interest_text", FOLLOWUP_INTEREST_TEXT)
         site = await site_url()
@@ -785,7 +785,7 @@ BUTTON_LABELS = {
     "q2_heard": "Вопрос 2: слышал, но не разбирался",
     "q2_no": "Вопрос 2: впервые слышу",
     "checklist_read": "Прочитал(а) чек-лист",
-    "followup_interest": "Хочу в команду",
+    "followup_interest": "Стать учеником",
     "get_lead_magnet": "Старый лид-магнит",
 }
 
