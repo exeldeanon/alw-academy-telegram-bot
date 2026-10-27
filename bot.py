@@ -105,11 +105,13 @@ FOLLOWUP_TEXT_2 = """👀 <b>Чек-лист ещё не открыл?</b>
 
 Открой материал на сайте, пока он не утонул в чатах 👇"""
 
-FOLLOWUP_TEXT_3 = """🔥 <b>Раз ты уже зарабатываешь — посмотри на это как на второй поток.</b>
+FOLLOWUP_TEXT_3 = """🎓 <b>Хочешь научиться зарабатывать на банковских продуктах?</b>
 
-Один человек — до 43 925 ₽ только с банков. 2–3 таких клиента в месяц — это уже +100К к тому, что у тебя есть.
+В ALW Academy мы с нуля разбираем, как устроена работа с банками, где искать клиентов, как оформлять заявки и как выстраивать стабильную связку.
 
-Это не вторая работа: банки, условия и готовые связки уже собраны на сайте ALW Academy."""
+Даём понятные материалы, рабочие примеры и поддержку по шагам — чтобы ты мог начать без хаоса и лишней теории.
+
+Подробнее об обучении — на сайте ALW Academy 👇"""
 
 FOLLOWUP_INTEREST_TEXT = """Отлично 🙌 Заявку на обучение получил — с тобой свяжутся в ближайшее время.
 
@@ -490,7 +492,13 @@ async def content_value(key: str, fallback: str) -> str:
     return value if value is not None else fallback
 
 
-async def followup_text(step: int) -> str:
+async def followup_text(step: int, user_id: int) -> str | None:
+    if step == 3:
+        user = await db.questionnaire(user_id)
+        # Ответ «Да, знаю» означает, что пользователь уже знаком с РКО;
+        # третий новичковый прогрев ему не отправляем.
+        if user.get("q2_answer") == "Да, знаю":
+            return None
     defaults = {1: FOLLOWUP_TEXT_1, 2: FOLLOWUP_TEXT_2, 3: FOLLOWUP_TEXT_3}
     value = await db.get_setting(f"followup_text_{step}")
     if value is None and step == 1:
@@ -527,7 +535,11 @@ async def send_checklist(bot: Bot, user_id: int) -> None:
 async def followup_worker(bot: Bot, user_id: int, due_at: float, step: int = 1) -> None:
     try:
         await asyncio.sleep(max(0.0, due_at - datetime.now(timezone.utc).timestamp()))
-        text = await followup_text(step)
+        text = await followup_text(step, user_id)
+        if text is None:
+            await db.mark_followup_sent(user_id)
+            logger.info("Follow-up step %s skipped for experienced user %s", step, user_id)
+            return
         await bot.send_message(user_id, text, reply_markup=await followup_keyboard(step))
         await db.mark_followup_sent(user_id)
         logger.info("Follow-up step %s sent to %s", step, user_id)
