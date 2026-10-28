@@ -378,7 +378,12 @@ class Database:
         async with self.conn.execute(query, params) as cursor:
             return [(str(row[0]), int(row[1]), int(row[2] or 0)) for row in await cursor.fetchall()]
 
-    async def source_statistics(self, since: str | None = None) -> list[tuple[str, str, int, int]]:
+    async def source_statistics(
+        self,
+        since: str | None = None,
+        *,
+        event: str | None = None,
+    ) -> list[tuple[str, str, int, int]]:
         assert self.conn is not None
         query = (
             "SELECT COALESCE(NULLIF(label,''), NULLIF(source,''), 'Без метки') AS label, "
@@ -386,12 +391,19 @@ class Database:
             "FROM events WHERE event IN ('start','join_request')"
         )
         params: list[Any] = []
+        if event:
+            query = query.replace("event IN ('start','join_request')", "event = ?")
+            params.append(event)
         if since:
             query += " AND occurred_at >= ?"
             params.append(since)
         query += " GROUP BY label, source ORDER BY total DESC"
         async with self.conn.execute(query, tuple(params)) as cursor:
             return [(str(row[0]), str(row[1]), int(row[2]), int(row[3] or 0)) for row in await cursor.fetchall()]
+
+    async def channel_source_statistics(self, since: str | None = None) -> list[tuple[str, str, int, int]]:
+        """Return only named Telegram invite-link sources for channel join requests."""
+        return await self.source_statistics(since, event="join_request")
 
     async def summary(self, since: str | None = None) -> dict[str, int]:
         assert self.conn is not None
@@ -1207,10 +1219,16 @@ async def admin_events_text(limit: int = 20) -> str:
 
 
 async def admin_sources_text() -> str:
-    rows = await db.source_statistics()
-    lines = ["🔗 <b>Источники входа</b>", "", "Для кампаний используй ссылки вида", "<code>https://t.me/бот?start=src_название</code>", ""]
+    rows = await db.channel_source_statistics()
+    lines = [
+        "🔗 <b>Источники входа в канал</b>",
+        "",
+        "Здесь показывается название именованной Telegram invite-ссылки, через которую человек подал заявку в канал.",
+        "Если у ссылки нет названия, будет показан её URL.",
+        "",
+    ]
     if not rows:
-        lines.append("Источников пока нет.")
+        lines.append("Заявок с источниками пока нет.")
     else:
         for label, source, total, users in rows[:30]:
             suffix = f" <code>{html.escape(source)}</code>" if source else ""
