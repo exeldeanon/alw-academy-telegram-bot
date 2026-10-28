@@ -16,6 +16,7 @@ import asyncio
 import csv
 import html
 import io
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -62,6 +63,7 @@ CHECKLIST_URL = os.getenv("CHECKLIST_URL", "https://alwacademy.ru/articles/test-
 
 FOLLOWUP_DELAYS_SECONDS = (15 * 60, 24 * 60 * 60, 24 * 60 * 60)
 BROADCAST_DELAY_SECONDS = 0.05
+ADMIN_EVENT_NOTIFICATIONS = os.getenv("ADMIN_EVENT_NOTIFICATIONS", "1").lower() not in {"0", "false", "no"}
 
 
 logging.basicConfig(
@@ -231,6 +233,12 @@ class Database:
             "checklist_sent_at": "TEXT",
             "checklist_read": "INTEGER NOT NULL DEFAULT 0",
             "checklist_read_at": "TEXT",
+            "first_seen_at": "TEXT",
+            "last_seen_at": "TEXT",
+            "source": "TEXT",
+            "source_label": "TEXT",
+            "start_payload": "TEXT",
+            "last_event": "TEXT",
         }
         for column, definition in migrations.items():
             if column not in existing_columns:
@@ -252,25 +260,174 @@ class Database:
                 clicked_at TEXT NOT NULL
             )"""
         )
+        await self.conn.execute(
+            """CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                event TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                occurred_at TEXT NOT NULL
+            )"""
+        )
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_events_time ON events(occurred_at)")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id, occurred_at)")
+        await self.conn.execute("CREATE INDEX IF NOT EXISTS idx_users_source ON users(source, source_label)")
         await self.conn.commit()
 
     async def close(self) -> None:
         if self.conn is not None:
             await self.conn.close()
 
-    async def upsert_user(self, user: Any, *, joined_at: str | None, joined_via_request: bool) -> None:
+    async def upsert_user(
+        self,
+        user: Any,
+        *,
+        joined_at: str | None,
+        joined_via_request: bool,
+        source: str | None = None,
+        source_label: str | None = None,
+        start_payload: str | None = None,
+        last_event: str | None = None,
+    ) -> bool:
         assert self.conn is not None
+        now = utc_now()
+        async with self.conn.execute("SELECT 1 FROM users WHERE user_id=?", (user.id,)) as cursor:
+            is_new = await cursor.fetchone() is None
         await self.conn.execute(
-            """INSERT INTO users (user_id, username, first_name, joined_at, joined_via_request)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO users (
+                   user_id, username, first_name, joined_at, joined_via_request,
+                   first_seen_at, last_seen_at, source, source_label, start_payload, last_event
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
                  username=excluded.username,
                  first_name=excluded.first_name,
                  joined_at=COALESCE(excluded.joined_at, users.joined_at),
-                 joined_via_request=MAX(users.joined_via_request, excluded.joined_via_request)""",
-            (user.id, user.username, user.first_name or "", joined_at, int(joined_via_request)),
+                 joined_via_request=MAX(users.joined_via_request, excluded.joined_via_request),
+                 first_seen_at=COALESCE(users.first_seen_at, excluded.first_seen_at),
+                 last_seen_at=excluded.last_seen_at,
+                 source=COALESCE(excluded.source, users.source),
+                 source_label=COALESCE(excluded.source_label, users.source_label),
+                 start_payload=COALESCE(excluded.start_payload, users.start_payload),
+                 last_event=COALESCE(excluded.last_event, users.last_event)""",
+            (
+                user.id,
+                user.username,
+                user.first_name or "",
+                joined_at,
+                int(joined_via_request),
+                now,
+                now,
+                source,
+                source_label,
+                start_payload,
+                last_event,
+            ),
         )
         await self.conn.commit()
+        return is_new
+
+    async def touch_user(self, user_id: int, event: str) -> None:
+        assert self.conn is not None
+        await self.conn.execute(
+            "UPDATE users SET last_seen_at=?, last_event=? WHERE user_id=?",
+            (utc_now(), event, user_id),
+        )
+        await self.conn.commit()
+
+    async def record_event(
+        self,
+        user_id: int | None,
+        event: str,
+        *,
+        label: str = "",
+        payload: dict[str, Any] | None = None,
+        source: str = "",
+    ) -> None:
+        assert self.conn is not None
+        encoded = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+        await self.conn.execute(
+            "INSERT INTO events(user_id,event,label,payload,source,occurred_at) VALUES (?,?,?,?,?,?)",
+            (user_id, event, label, encoded, source, utc_now()),
+        )
+        if user_id is not None:
+            await self.conn.execute(
+                "UPDATE users SET last_seen_at=?, last_event=? WHERE user_id=?",
+                (utc_now(), event, user_id),
+            )
+        await self.conn.commit()
+
+    async def recent_events(self, limit: int = 20) -> list[aiosqlite.Row]:
+        assert self.conn is not None
+        async with self.conn.execute(
+            "SELECT e.*, u.username, u.first_name FROM events e LEFT JOIN users u ON u.user_id=e.user_id "
+            "ORDER BY e.id DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            return await cursor.fetchall()
+
+    async def event_statistics(self, since: str | None = None) -> list[tuple[str, int, int]]:
+        assert self.conn is not None
+        query = "SELECT event, COUNT(*) AS total, COUNT(DISTINCT user_id) AS users FROM events"
+        params: tuple[Any, ...] = ()
+        if since:
+            query += " WHERE occurred_at >= ?"
+            params = (since,)
+        query += " GROUP BY event ORDER BY total DESC"
+        async with self.conn.execute(query, params) as cursor:
+            return [(str(row[0]), int(row[1]), int(row[2] or 0)) for row in await cursor.fetchall()]
+
+    async def source_statistics(self, since: str | None = None) -> list[tuple[str, str, int, int]]:
+        assert self.conn is not None
+        query = (
+            "SELECT COALESCE(NULLIF(label,''), NULLIF(source,''), 'Без метки') AS label, "
+            "COALESCE(source,'') AS source, COUNT(*) AS total, COUNT(DISTINCT user_id) AS users "
+            "FROM events WHERE event IN ('start','join_request')"
+        )
+        params: list[Any] = []
+        if since:
+            query += " AND occurred_at >= ?"
+            params.append(since)
+        query += " GROUP BY label, source ORDER BY total DESC"
+        async with self.conn.execute(query, tuple(params)) as cursor:
+            return [(str(row[0]), str(row[1]), int(row[2]), int(row[3] or 0)) for row in await cursor.fetchall()]
+
+    async def summary(self, since: str | None = None) -> dict[str, int]:
+        assert self.conn is not None
+        where = "WHERE first_seen_at >= ?" if since else ""
+        params: tuple[Any, ...] = (since,) if since else ()
+        async with self.conn.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(joined_via_request),0), COALESCE(SUM(blocked),0), "
+            f"COALESCE(SUM(checklist_read),0), COALESCE(SUM(q2_answer IS NOT NULL),0), "
+            f"COALESCE(SUM(checklist_sent_at IS NOT NULL),0) FROM users {where}", params,
+        ) as cursor:
+            row = await cursor.fetchone()
+        event_where = "WHERE occurred_at >= ?" if since else ""
+        async with self.conn.execute(
+            f"SELECT COUNT(*), COUNT(DISTINCT user_id) FROM events {event_where}", params,
+        ) as cursor:
+            event_row = await cursor.fetchone()
+        return {
+            "users": int(row[0] or 0),
+            "joined": int(row[1] or 0),
+            "blocked": int(row[2] or 0),
+            "read": int(row[3] or 0),
+            "answered": int(row[4] or 0),
+            "sent": int(row[5] or 0),
+            "events": int(event_row[0] or 0),
+            "active": int(event_row[1] or 0),
+        }
+
+    async def detailed_user(self, user_id: int) -> tuple[aiosqlite.Row | None, list[aiosqlite.Row]]:
+        assert self.conn is not None
+        async with self.conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)) as cursor:
+            user = await cursor.fetchone()
+        async with self.conn.execute(
+            "SELECT * FROM events WHERE user_id=? ORDER BY id DESC LIMIT 100", (user_id,)
+        ) as cursor:
+            events = await cursor.fetchall()
+        return user, events
 
     async def mark_lead_clicked(self, user_id: int) -> None:
         assert self.conn is not None
@@ -349,6 +506,14 @@ class Database:
             "INSERT INTO button_clicks(user_id, button, clicked_at) VALUES (?, ?, ?)",
             (user_id, button, utc_now()),
         )
+        await self.conn.execute(
+            "INSERT INTO events(user_id,event,label,payload,source,occurred_at) VALUES (?,?,?,?,?,?)",
+            (user_id, "button_click", button, "{}", "", utc_now()),
+        )
+        await self.conn.execute(
+            "UPDATE users SET last_seen_at=?, last_event=? WHERE user_id=?",
+            (utc_now(), "button_click:" + button, user_id),
+        )
         await self.conn.commit()
 
     async def button_statistics(self) -> list[tuple[str, int, int]]:
@@ -363,7 +528,8 @@ class Database:
         assert self.conn is not None
         async with self.conn.execute(
             """SELECT user_id, username, first_name, joined_at, joined_via_request,
-                      q1_answer, q2_answer, checklist_sent_at, checklist_read, blocked
+                      q1_answer, q2_answer, checklist_sent_at, checklist_read, blocked,
+                      first_seen_at, last_seen_at, source, source_label, last_event
                FROM users ORDER BY COALESCE(joined_at, '') DESC, user_id DESC LIMIT ? OFFSET ?""",
             (limit, offset),
         ) as cursor:
@@ -385,7 +551,8 @@ class Database:
         assert self.conn is not None
         async with self.conn.execute(
             """SELECT u.user_id, u.username, u.first_name, u.joined_at,
-                      u.joined_via_request, u.q1_answer, u.q2_answer,
+                      u.first_seen_at, u.last_seen_at, u.source, u.source_label, u.start_payload,
+                      u.last_event, u.joined_via_request, u.q1_answer, u.q2_answer,
                       u.checklist_sent_at, u.checklist_read, u.blocked,
                       COALESCE((SELECT COUNT(*) FROM button_clicks b WHERE b.user_id=u.user_id),0)
                FROM users u ORDER BY COALESCE(u.joined_at,'') DESC"""
@@ -394,10 +561,25 @@ class Database:
         output = io.StringIO()
         writer = csv.writer(output)
         writer.writerow([
-            "user_id", "username", "first_name", "joined_at", "joined_via_request",
-            "q1_answer", "q2_answer", "checklist_sent_at", "checklist_read", "blocked",
-            "button_clicks",
+            "user_id", "username", "first_name", "joined_at", "first_seen_at", "last_seen_at",
+            "source", "source_label", "start_payload", "last_event", "joined_via_request",
+            "q1_answer", "q2_answer", "checklist_sent_at", "checklist_read", "blocked", "button_clicks",
         ])
+        writer.writerows(rows)
+        return output.getvalue()
+
+    async def export_events_csv(self) -> str:
+        assert self.conn is not None
+        async with self.conn.execute(
+            """SELECT e.occurred_at, e.user_id, u.username, u.first_name,
+                      e.event, e.label, e.source, e.payload
+               FROM events e LEFT JOIN users u ON u.user_id=e.user_id
+               ORDER BY e.id DESC"""
+        ) as cursor:
+            rows = await cursor.fetchall()
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["occurred_at", "user_id", "username", "first_name", "event", "label", "source", "payload"])
         writer.writerows(rows)
         return output.getvalue()
 
@@ -479,6 +661,39 @@ def display_name(user: Any) -> str:
     return html.escape(raw_name)
 
 
+def start_payload(text: str | None) -> str:
+    """Extract Telegram deep-link payload from a /start message."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    parts = raw.split(maxsplit=1)
+    first = parts[0]
+    if first.lower().startswith("/start="):
+        return first.split("=", 1)[1].strip()
+    if first.lower() == "/start" and len(parts) > 1:
+        return parts[1].split(maxsplit=1)[0].strip()
+    if first.lower().startswith("/start"):
+        return first[6:].lstrip("_")
+    return ""
+
+
+def source_label_from_payload(payload: str) -> str:
+    if not payload:
+        return "Прямой вход"
+    # Keep the label human-readable while preserving the original payload for
+    # exact attribution. Campaign links can use /start=src_name or /start=name.
+    return payload.removeprefix("src_").replace("_", " ").strip() or payload
+
+
+async def notify_admin(bot: Bot, text: str) -> None:
+    if not ADMIN_ID or not ADMIN_EVENT_NOTIFICATIONS:
+        return
+    try:
+        await bot.send_message(ADMIN_ID, text)
+    except TelegramAPIError:
+        logger.exception("Could not send admin event notification")
+
+
 async def resolve_checklist_file() -> str | FSInputFile | None:
     value = (await db.get_setting("checklist_file_id") or CHECKLIST_FILE_PATH).strip()
     if not value:
@@ -529,6 +744,8 @@ async def send_checklist(bot: Bot, user_id: int) -> None:
     caption = await content_value("checklist_caption", CHECKLIST_CAPTION)
     await bot.send_message(user_id, caption, reply_markup=checklist_keyboard(url))
     await db.mark_checklist_sent(user_id)
+    await db.record_event(user_id, "checklist_sent", label="Лид-магнит отправлен", payload={"url": url})
+    await notify_admin(bot, f"📨 <b>Лид-магнит отправлен</b> · <code>{user_id}</code>")
     await schedule_followup(bot, user_id)
 
 
@@ -542,6 +759,8 @@ async def followup_worker(bot: Bot, user_id: int, due_at: float, step: int = 1) 
             return
         await bot.send_message(user_id, text, reply_markup=await followup_keyboard(step))
         await db.mark_followup_sent(user_id)
+        await db.record_event(user_id, "followup_sent", label=f"Дожим {step}")
+        await notify_admin(bot, f"📨 <b>Дожим {step} отправлен</b> · <code>{user_id}</code>")
         logger.info("Follow-up step %s sent to %s", step, user_id)
         if step < len(FOLLOWUP_DELAYS_SECONDS):
             next_step = step + 1
@@ -597,6 +816,10 @@ def is_admin(message: Message) -> bool:
     return bool(ADMIN_ID) and message.from_user is not None and message.from_user.id == ADMIN_ID
 
 
+def is_admin_user(user: Any) -> bool:
+    return bool(ADMIN_ID) and user is not None and getattr(user, "id", None) == ADMIN_ID
+
+
 CONTENT_FIELDS = {
     "welcome": ("welcome_text", "приветственное сообщение после одобрения заявки", WELCOME_TEXT_APPROVED),
     "checklist": ("checklist_caption", "текст перед ссылкой на материал", CHECKLIST_CAPTION),
@@ -650,9 +873,33 @@ async def run_broadcast(bot: Bot, source: Message) -> tuple[int, int]:
 @router.chat_join_request()
 async def handle_join_request(request: ChatJoinRequest, bot: Bot) -> None:
     user = request.from_user
+    invite = getattr(request, "invite_link", None)
+    invite_url = str(getattr(invite, "invite_link", "") or "")
+    invite_name = str(getattr(invite, "name", "") or "")
+    source_label = invite_name or invite_url or "Заявка в канал"
     # Keep a record even if Telegram rejects a withdrawn/expired request; the
     # accepted count is updated only after approve_chat_join_request succeeds.
-    await db.upsert_user(user, joined_at=None, joined_via_request=False)
+    is_new = await db.upsert_user(
+        user,
+        joined_at=None,
+        joined_via_request=False,
+        source="invite",
+        source_label=source_label,
+        last_event="join_request",
+    )
+    await db.record_event(
+        user.id,
+        "join_request",
+        label=source_label,
+        payload={"invite_url": invite_url, "invite_name": invite_name, "chat_id": request.chat.id},
+        source="invite",
+    )
+    if is_new:
+        await notify_admin(
+            bot,
+            f"🆕 <b>Новый пользователь</b>\n{display_name(user)} · <code>{user.id}</code>\n"
+            f"Источник: <b>{html.escape(source_label)}</b>",
+        )
 
     # Telegram grants the temporary user_chat_id permission until the request
     # is processed. Send the welcome first, then approve immediately; this is
@@ -668,6 +915,7 @@ async def handle_join_request(request: ChatJoinRequest, bot: Bot) -> None:
     try:
         await bot.approve_chat_join_request(chat_id=request.chat.id, user_id=user.id)
         await db.upsert_user(user, joined_at=utc_now(), joined_via_request=True)
+        await db.record_event(user.id, "join_approved", label="Заявка в канал одобрена")
         logger.info("Approved join request: user=%s chat=%s", user.id, request.chat.id)
     except TelegramAPIError:
         logger.exception("Could not approve join request from %s", user.id)
@@ -681,7 +929,31 @@ async def start_questionnaire(bot: Bot, user: Any, state: FSMContext) -> None:
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def handle_start(message: Message, bot: Bot, state: FSMContext) -> None:
     assert message.from_user is not None
-    await db.upsert_user(message.from_user, joined_at=None, joined_via_request=False)
+    payload = start_payload(message.text)
+    source = "deep_link" if payload else "direct"
+    label = source_label_from_payload(payload)
+    is_new = await db.upsert_user(
+        message.from_user,
+        joined_at=None,
+        joined_via_request=False,
+        source=source,
+        source_label=label,
+        start_payload=payload or None,
+        last_event="start",
+    )
+    await db.record_event(
+        message.from_user.id,
+        "start",
+        label=label,
+        payload={"payload": payload, "text": message.text or ""},
+        source=source,
+    )
+    if is_new:
+        await notify_admin(
+            bot,
+            f"🆕 <b>Новый пользователь в боте</b>\n{display_name(message.from_user)} · "
+            f"<code>{message.from_user.id}</code>\nИсточник: <b>{html.escape(label)}</b>",
+        )
     try:
         await start_questionnaire(bot, message.from_user, state)
     except TelegramForbiddenError:
@@ -694,6 +966,11 @@ async def handle_start(message: Message, bot: Bot, state: FSMContext) -> None:
 async def handle_question_1(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     user = callback.from_user
     await db.record_button_click(user.id, callback.data or "q1_unknown")
+    await notify_admin(
+        bot,
+        f"🖱 <b>Нажатие</b> · {display_name(user)} · <code>{user.id}</code>\n"
+        f"{html.escape(BUTTON_LABELS.get(callback.data or '', callback.data or 'q1_unknown'))}",
+    )
     await db.upsert_user(user, joined_at=None, joined_via_request=False)
     answer = {
         "q1_yes": "Да, уже зарабатываю",
@@ -704,6 +981,7 @@ async def handle_question_1(callback: CallbackQuery, bot: Bot, state: FSMContext
         await callback.answer()
         return
     await db.save_questionnaire_answer(user.id, 1, answer)
+    await db.record_event(user.id, "question_answer", label="Вопрос 1", payload={"answer": answer})
     await callback.answer()
     await state.set_state(QuestionnaireState.question_2)
     try:
@@ -718,6 +996,11 @@ async def handle_question_1(callback: CallbackQuery, bot: Bot, state: FSMContext
 async def handle_question_2(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     user = callback.from_user
     await db.record_button_click(user.id, callback.data or "q2_unknown")
+    await notify_admin(
+        bot,
+        f"🖱 <b>Нажатие</b> · {display_name(user)} · <code>{user.id}</code>\n"
+        f"{html.escape(BUTTON_LABELS.get(callback.data or '', callback.data or 'q2_unknown'))}",
+    )
     answer = {
         "q2_yes": "Да, знаю",
         "q2_heard": "Слышал, но не разбирался",
@@ -728,6 +1011,7 @@ async def handle_question_2(callback: CallbackQuery, bot: Bot, state: FSMContext
         return
     await db.upsert_user(user, joined_at=None, joined_via_request=False)
     await db.save_questionnaire_answer(user.id, 2, answer)
+    await db.record_event(user.id, "question_answer", label="Вопрос 2", payload={"answer": answer})
     await state.clear()
     await callback.answer("Спасибо за ответы!")
     try:
@@ -739,15 +1023,25 @@ async def handle_question_2(callback: CallbackQuery, bot: Bot, state: FSMContext
 
 
 @router.callback_query(F.data == "checklist_read")
-async def handle_checklist_read(callback: CallbackQuery) -> None:
+async def handle_checklist_read(callback: CallbackQuery, bot: Bot) -> None:
     await db.record_button_click(callback.from_user.id, "checklist_read")
     await db.mark_checklist_read(callback.from_user.id)
+    await notify_admin(
+        bot,
+        f"✅ <b>Чек-лист отмечен прочитанным</b> · {display_name(callback.from_user)} · "
+        f"<code>{callback.from_user.id}</code>",
+    )
     await callback.answer("Отлично ✅")
 
 
 @router.callback_query(F.data == "followup_interest")
 async def handle_followup_interest(callback: CallbackQuery, bot: Bot) -> None:
     await db.record_button_click(callback.from_user.id, "followup_interest")
+    await notify_admin(
+        bot,
+        f"🎓 <b>Интерес к обучению</b> · {display_name(callback.from_user)} · "
+        f"<code>{callback.from_user.id}</code>",
+    )
     await callback.answer("Заявка на обучение принята ✅")
     try:
         text = await content_value("followup_interest_text", FOLLOWUP_INTEREST_TEXT)
@@ -769,6 +1063,11 @@ async def handle_followup_interest(callback: CallbackQuery, bot: Bot) -> None:
 async def handle_legacy_lead_button(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     """Keep old welcome messages usable while users transition to the quiz."""
     await db.record_button_click(callback.from_user.id, "get_lead_magnet")
+    await notify_admin(
+        bot,
+        f"📖 <b>Открыт старый лид-магнит</b> · {display_name(callback.from_user)} · "
+        f"<code>{callback.from_user.id}</code>",
+    )
     await callback.answer()
     await start_questionnaire(bot, callback.from_user, state)
 
@@ -802,10 +1101,341 @@ BUTTON_LABELS = {
 }
 
 
+def admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="📚 Всё время", callback_data="admin:stats:0"),
+                InlineKeyboardButton(text="📊 За 24 часа", callback_data="admin:stats:1"),
+                InlineKeyboardButton(text="📈 За 7 дней", callback_data="admin:stats:7"),
+            ],
+            [InlineKeyboardButton(text="🗓 За 30 дней", callback_data="admin:stats:30")],
+            [
+                InlineKeyboardButton(text="🛰 Последние события", callback_data="admin:events"),
+                InlineKeyboardButton(text="🔗 Источники", callback_data="admin:sources"),
+            ],
+            [
+                InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:1"),
+                InlineKeyboardButton(text="📝 Контент бота", callback_data="admin:content"),
+            ],
+            [InlineKeyboardButton(text="📤 Выгрузить CSV", callback_data="admin:csv")],
+        ]
+    )
+
+
+def admin_content_keyboard() -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for alias in ("welcome", "question_1", "question_2", "checklist", "checklist_url", "followup_1", "followup_2", "followup_3", "followup_interest"):
+        rows.append([
+            InlineKeyboardButton(text=f"✏️ {alias}", callback_data=f"admin:edit:{alias}"),
+            InlineKeyboardButton(text="↩️ сбросить", callback_data=f"admin:reset:{alias}"),
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ В панель", callback_data="admin:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def display_user_label(row: Any) -> str:
     username = row["username"] if row["username"] else None
     first_name = row["first_name"] or "Без имени"
     return html.escape(f"@{username}" if username else first_name)
+
+
+def iso_since(days: int) -> str:
+    return datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() - max(1, days) * 86400,
+        timezone.utc,
+    ).isoformat(timespec="seconds")
+
+
+EVENT_LABELS = {
+    "start": "Запуск бота",
+    "join_request": "Заявка в канал",
+    "join_approved": "Заявка одобрена",
+    "button_click": "Нажатие кнопки",
+    "question_answer": "Ответ на вопрос",
+    "checklist_sent": "Лид-магнит отправлен",
+    "followup_sent": "Дожим отправлен",
+}
+
+
+def event_user_label(row: Any) -> str:
+    username = row["username"] if row["username"] else None
+    name = f"@{username}" if username else (row["first_name"] or "Без имени")
+    return html.escape(str(name))
+
+
+async def admin_stats_text(days: int | None = None) -> str:
+    since = iso_since(days) if days else None
+    summary = await db.summary(since)
+    events = await db.event_statistics(since)
+    period = f"за последние {days} дн." if days else "за всё время"
+    lines = [
+        f"📊 <b>Панель ALW</b> · {period}",
+        "",
+        f"👥 Пользователи: <b>{summary['users']}</b>",
+        f"✅ Заявки в канал: <b>{summary['joined']}</b>",
+        f"⚡ Активные пользователи: <b>{summary['active']}</b>",
+        f"🧩 Завершили анкету: <b>{summary['answered']}</b>",
+        f"📖 Получили материал: <b>{summary['sent']}</b>",
+        f"🛰 События: <b>{summary['events']}</b>",
+        f"📖 Отметили материал: <b>{summary['read']}</b>",
+        f"⛔ Заблокировали бота: <b>{summary['blocked']}</b>",
+        "",
+        "<b>События:</b>",
+    ]
+    if events:
+        for event, total, users in events[:12]:
+            lines.append(f"• {html.escape(EVENT_LABELS.get(event, event))}: <b>{total}</b> · людей <b>{users}</b>")
+    else:
+        lines.append("Пока событий нет.")
+    return "\n".join(lines)
+
+
+async def admin_events_text(limit: int = 20) -> str:
+    rows = await db.recent_events(limit)
+    lines = ["🛰 <b>Последние события</b>", ""]
+    if not rows:
+        lines.append("Пока событий нет.")
+    for row in rows:
+        stamp = html.escape(str(row["occurred_at"])[5:19].replace("T", " "))
+        user = event_user_label(row) if row["user_id"] else "система"
+        event = html.escape(EVENT_LABELS.get(row["event"], row["event"]))
+        label = html.escape(str(row["label"] or ""))
+        suffix = f" · {label}" if label else ""
+        lines.append(f"<code>{stamp}</code> · {user}\n└ {event}{suffix}")
+    return "\n".join(lines)
+
+
+async def admin_sources_text() -> str:
+    rows = await db.source_statistics()
+    lines = ["🔗 <b>Источники входа</b>", "", "Для кампаний используй ссылки вида", "<code>https://t.me/бот?start=src_название</code>", ""]
+    if not rows:
+        lines.append("Источников пока нет.")
+    else:
+        for label, source, total, users in rows[:30]:
+            suffix = f" <code>{html.escape(source)}</code>" if source else ""
+            lines.append(f"• <b>{html.escape(label)}</b>{suffix} · входов <b>{total}</b> · людей <b>{users}</b>")
+    return "\n".join(lines)
+
+
+async def admin_users_text(page: int = 1) -> str:
+    page = max(1, page)
+    rows = await db.list_users(limit=10, offset=(page - 1) * 10)
+    lines = [f"👥 <b>Пользователи · страница {page}</b>", ""]
+    if not rows:
+        return "\n".join(lines + ["На этой странице пользователей нет."])
+    for row in rows:
+        user = display_user_label(row)
+        source = html.escape(str(row["source_label"] or row["source"] or "—"))
+        last = html.escape(str(row["last_seen_at"] or row["joined_at"] or "—")[5:19].replace("T", " "))
+        lines.append(f"<code>{row['user_id']}</code> {user}\n└ источник: {source} · активность: {last}")
+    return "\n".join(lines)
+
+
+def users_page_keyboard(page: int, user_ids: list[int] | None = None) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for user_id in user_ids or []:
+        rows.append([InlineKeyboardButton(text=f"👤 Открыть {user_id}", callback_data=f"admin:user:{user_id}")])
+    for offset, label in ((-1, "⬅️"), (1, "➡️")):
+        target = max(1, page + offset)
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"admin:users:{target}")])
+    rows.append([InlineKeyboardButton(text="⬅️ В панель", callback_data="admin:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("admin"), F.chat.type == ChatType.PRIVATE)
+@router.message(Command("panel"), F.chat.type == ChatType.PRIVATE)
+async def handle_admin_panel(message: Message) -> None:
+    if not is_admin(message):
+        return
+    await message.answer(await admin_stats_text(), reply_markup=admin_panel_keyboard())
+
+
+@router.callback_query(F.data == "admin:back")
+async def handle_admin_back(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(await admin_stats_text(), reply_markup=admin_panel_keyboard())
+
+
+@router.callback_query(F.data.startswith("admin:stats:"))
+async def handle_admin_stats(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    try:
+        days = int((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        days = 7
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(await admin_stats_text(days), reply_markup=admin_panel_keyboard())
+
+
+@router.callback_query(F.data == "admin:events")
+async def handle_admin_events(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            await admin_events_text(),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:events")],
+                [InlineKeyboardButton(text="⬅️ В панель", callback_data="admin:back")],
+            ]),
+        )
+
+
+@router.callback_query(F.data == "admin:sources")
+async def handle_admin_sources(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            await admin_sources_text(),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin:sources")],
+                [InlineKeyboardButton(text="⬅️ В панель", callback_data="admin:back")],
+            ]),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:users:"))
+async def handle_admin_users(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    try:
+        page = int((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        page = 1
+    await callback.answer()
+    if callback.message:
+        user_rows = await db.list_users(limit=10, offset=(page - 1) * 10)
+        await callback.message.edit_text(
+            await admin_users_text(page),
+            reply_markup=users_page_keyboard(page, [int(row["user_id"]) for row in user_rows]),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:user:"))
+async def handle_admin_user_detail(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    try:
+        user_id = int((callback.data or "").rsplit(":", 1)[-1])
+    except ValueError:
+        await callback.answer("Некорректный пользователь", show_alert=True)
+        return
+    row, events = await db.detailed_user(user_id)
+    if row is None:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    lines = [
+        f"👤 <b>{display_user_label(row)}</b> · <code>{user_id}</code>",
+        f"Первый вход: <code>{html.escape(str(row['first_seen_at'] or row['joined_at'] or '—'))}</code>",
+        f"Последняя активность: <code>{html.escape(str(row['last_seen_at'] or '—'))}</code>",
+        f"Источник: <b>{html.escape(str(row['source_label'] or row['source'] or '—'))}</b>",
+        f"Payload: <code>{html.escape(str(row['start_payload'] or '—'))}</code>",
+        f"Анкета: {html.escape(str(row['q1_answer'] or '—'))} / {html.escape(str(row['q2_answer'] or '—'))}",
+        f"Материал: {'отправлен' if row['checklist_sent_at'] else 'не отправлен'} · "
+        f"прочитан: {'да' if row['checklist_read'] else 'нет'}",
+        f"Заявка в канал: {'да' if row['joined_via_request'] else 'нет'} · "
+        f"заблокировал: {'да' if row['blocked'] else 'нет'}",
+        "",
+        "<b>Последние события:</b>",
+    ]
+    for event in events[:30]:
+        label = html.escape(str(event["label"] or EVENT_LABELS.get(event["event"], event["event"])))
+        payload = str(event["payload"] or "")
+        if payload and payload != "{}":
+            payload = html.escape(payload[:160])
+            label += f" · <code>{payload}</code>"
+        lines.append(
+            f"• <code>{html.escape(str(event['occurred_at']))}</code> "
+            f"{html.escape(EVENT_LABELS.get(event['event'], event['event']))} — {label}"
+        )
+    if not events:
+        lines.append("Событий пока нет.")
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="← Пользователи", callback_data="admin:users:1")],
+        [InlineKeyboardButton(text="← В панель", callback_data="admin:back")],
+    ])
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text("\n".join(lines), reply_markup=markup)
+
+
+@router.callback_query(F.data == "admin:content")
+async def handle_admin_content_panel(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "📝 <b>Контент бота</b>\n\nВыбери сообщение, которое нужно изменить. После нажатия пришли новый текст одним сообщением.",
+            reply_markup=admin_content_keyboard(),
+        )
+
+
+@router.callback_query(F.data.startswith("admin:edit:"))
+async def handle_admin_content_edit(callback: CallbackQuery, state: FSMContext) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    alias = (callback.data or "").split(":", 2)[-1]
+    if alias not in CONTENT_FIELDS:
+        await callback.answer("Настройка не найдена", show_alert=True)
+        return
+    key, label, fallback = CONTENT_FIELDS[alias]
+    current = await content_value(key, fallback)
+    await state.set_state(ContentState.waiting_for_value)
+    await state.update_data(content_alias=alias)
+    await callback.answer("Жду новый текст")
+    if callback.message:
+        preview = html.escape(current[:1500])
+        await callback.message.edit_text(
+            f"✏️ <b>{html.escape(alias)}</b> · {html.escape(label)}\n\n"
+            f"<b>Текущий текст:</b>\n<blockquote>{preview}</blockquote>\n\n"
+            "Пришли новый текст следующим сообщением. Для отмены — /cancel.",
+        )
+
+
+@router.callback_query(F.data.startswith("admin:reset:"))
+async def handle_admin_content_reset(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    alias = (callback.data or "").split(":", 2)[-1]
+    if alias not in CONTENT_FIELDS:
+        await callback.answer("Настройка не найдена", show_alert=True)
+        return
+    await db.delete_setting(CONTENT_FIELDS[alias][0])
+    await db.record_event(callback.from_user.id, "content_reset", label=alias)
+    await callback.answer("Сброшено")
+    if callback.message:
+        await callback.message.edit_text(
+            "✅ Настройка возвращена к исходному значению.",
+            reply_markup=admin_content_keyboard(),
+        )
+
+
+@router.callback_query(F.data == "admin:csv")
+async def handle_admin_csv(callback: CallbackQuery, bot: Bot) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    await callback.answer("Готовлю выгрузку…")
+    csv_text = await db.export_users_csv()
+    await bot.send_document(
+        callback.from_user.id,
+        BufferedInputFile(csv_text.encode("utf-8-sig"), filename="alw_users.csv"),
+        caption="📄 Пользователи и события",
+    )
+    await bot.send_document(
+        callback.from_user.id,
+        BufferedInputFile((await db.export_events_csv()).encode("utf-8-sig"), filename="alw_events.csv"),
+        caption="🛰 Полный журнал событий",
+    )
 
 
 @router.message(Command("analytics"), F.chat.type == ChatType.PRIVATE)
@@ -883,6 +1513,10 @@ async def handle_user_detail(message: Message) -> None:
         f"👤 <b>Пользователь {user_id}</b>",
         f"Имя: {display_user_label(row)}",
         f"Вход: {html.escape(str(row['joined_at'] or '—'))}",
+        f"Источник: {html.escape(str(row['source_label'] or row['source'] or '—'))}",
+        f"Первый контакт: {html.escape(str(row['first_seen_at'] or '—'))}",
+        f"Последняя активность: {html.escape(str(row['last_seen_at'] or '—'))}",
+        f"Последнее событие: {html.escape(str(row['last_event'] or '—'))}",
         f"Заявка принята: {'да' if row['joined_via_request'] else 'нет'}",
         f"Вопрос 1: {html.escape(str(row['q1_answer'] or '—'))}",
         f"Вопрос 2: {html.escape(str(row['q2_answer'] or '—'))}",
@@ -909,6 +1543,11 @@ async def handle_users_csv(message: Message, bot: Bot) -> None:
     csv_text = await db.export_users_csv()
     document = BufferedInputFile(csv_text.encode("utf-8-sig"), filename="alw_users.csv")
     await bot.send_document(message.chat.id, document, caption="📄 Выгрузка пользователей и событий кнопок")
+    await bot.send_document(
+        message.chat.id,
+        BufferedInputFile((await db.export_events_csv()).encode("utf-8-sig"), filename="alw_events.csv"),
+        caption="🛰 Полный журнал событий",
+    )
 
 
 @router.message(Command("broadcast"), F.chat.type == ChatType.PRIVATE)
@@ -993,6 +1632,7 @@ async def handle_content_value(message: Message, state: FSMContext) -> None:
         return
     key = CONTENT_FIELDS[alias][0]
     await db.set_setting(key, value)
+    await db.record_event(message.from_user.id, "content_update", label=alias)
     await state.clear()
     await message.answer(f"✅ Контент <b>{alias}</b> обновлён. Новые пользователи получат новую версию.")
 
