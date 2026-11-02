@@ -605,6 +605,20 @@ class Database:
     async def set_paused(self, value: bool) -> None:
         await self.set_setting("bot_paused", "1" if value else "0")
 
+    async def reset_statistics(self) -> None:
+        """Clear funnel analytics while preserving the user directory."""
+        assert self.conn is not None
+        await self.conn.execute("DELETE FROM events")
+        await self.conn.execute("DELETE FROM button_clicks")
+        await self.conn.execute("DELETE FROM followups")
+        await self.conn.execute(
+            """UPDATE users SET joined_at=NULL, joined_via_request=0,
+               lead_clicked=0, lead_clicked_at=NULL, q1_answer=NULL, q2_answer=NULL,
+               checklist_sent_at=NULL, checklist_read=0, checklist_read_at=NULL,
+               last_event=NULL"""
+        )
+        await self.conn.commit()
+
     async def waiting_for_checklist(self) -> list[int]:
         assert self.conn is not None
         async with self.conn.execute(
@@ -1260,6 +1274,14 @@ async def handle_bot_status(message: Message) -> None:
     await message.answer(f"Статус бота: <b>{state}</b>")
 
 
+@router.message(Command("reset_stats"), F.chat.type == ChatType.PRIVATE)
+async def handle_reset_stats(message: Message) -> None:
+    if not is_admin(message):
+        return
+    await db.reset_statistics()
+    await message.answer("✅ Статистика очищена. Пользователи сохранены для дальнейшей работы.")
+
+
 BUTTON_LABELS = {
     "q1_yes": "Вопрос 1: уже зарабатываю",
     "q1_try": "Вопрос 1: пробую, но слабо",
@@ -1292,6 +1314,7 @@ def admin_panel_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📝 Контент бота", callback_data="admin:content"),
             ],
             [InlineKeyboardButton(text="📤 Выгрузить CSV", callback_data="admin:csv")],
+            [InlineKeyboardButton(text="🧹 Очистить статистику", callback_data="admin:reset_stats")],
         ]
     )
 
@@ -1512,6 +1535,32 @@ async def handle_admin_back(callback: CallbackQuery) -> None:
     if not is_admin_user(callback.from_user):
         return
     await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(await admin_stats_text(), reply_markup=admin_panel_keyboard())
+
+
+@router.callback_query(F.data == "admin:reset_stats")
+async def handle_admin_reset_stats_prompt(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, очистить статистику", callback_data="admin:reset_stats:confirm")],
+        [InlineKeyboardButton(text="↩️ Отмена", callback_data="admin:back")],
+    ])
+    await callback.answer()
+    if callback.message:
+        await callback.message.edit_text(
+            "⚠️ Очистить события, клики и показатели воронки? Пользователи сохранятся.",
+            reply_markup=markup,
+        )
+
+
+@router.callback_query(F.data == "admin:reset_stats:confirm")
+async def handle_admin_reset_stats_confirm(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    await db.reset_statistics()
+    await callback.answer("Статистика очищена ✅", show_alert=True)
     if callback.message:
         await callback.message.edit_text(await admin_stats_text(), reply_markup=admin_panel_keyboard())
 
