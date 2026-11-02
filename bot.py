@@ -1238,16 +1238,8 @@ async def handle_legacy_lead_button(callback: CallbackQuery, bot: Bot, state: FS
 async def handle_stats(message: Message) -> None:
     if not is_admin(message):
         return
-    total, leads = await db.stats()
-    answered, sent, read = await db.questionnaire_stats()
-    await message.answer(
-        f"📊 <b>Статистика ALW | Лидогенерация</b>\n\n"
-        f"Приняли в канал: <b>{total}</b>\n"
-        f"Завершили вопросы: <b>{answered}</b>\n"
-        f"Получили чек-лист: <b>{sent}</b>\n"
-        f"Нажали «Прочитал(а)»: <b>{read}</b>\n"
-        f"Старый лид-магнит: <b>{leads}</b>",
-    )
+    text, markup = await admin_channels_text()
+    await message.answer(text, reply_markup=markup)
 
 
 @router.message(Command("pause"), F.chat.type == ChatType.PRIVATE)
@@ -1298,16 +1290,6 @@ BUTTON_LABELS = {
 def admin_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📚 Всё время", callback_data="admin:stats:0"),
-                InlineKeyboardButton(text="📊 За 24 часа", callback_data="admin:stats:1"),
-                InlineKeyboardButton(text="📈 За 7 дней", callback_data="admin:stats:7"),
-            ],
-            [InlineKeyboardButton(text="🗓 За 30 дней", callback_data="admin:stats:30")],
-            [
-                InlineKeyboardButton(text="🛰 Последние события", callback_data="admin:events"),
-                InlineKeyboardButton(text="🔗 Источники", callback_data="admin:sources"),
-            ],
             [InlineKeyboardButton(text="📡 Выбрать канал", callback_data="admin:channels")],
             [
                 InlineKeyboardButton(text="👥 Пользователи", callback_data="admin:users:1"),
@@ -1458,7 +1440,8 @@ async def admin_channels_text() -> tuple[str, InlineKeyboardMarkup]:
                     callback_data=f"admin:channel:{channel['chat_id']}:0",
                 )
             ])
-    rows.append([InlineKeyboardButton(text="⬅️ В общую панель", callback_data="admin:back")])
+    rows.append([InlineKeyboardButton(text="📝 Контент бота", callback_data="admin:content")])
+    rows.append([InlineKeyboardButton(text="🧹 Очистить статистику", callback_data="admin:reset_stats")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1527,7 +1510,8 @@ def users_page_keyboard(page: int, user_ids: list[int] | None = None) -> InlineK
 async def handle_admin_panel(message: Message) -> None:
     if not is_admin(message):
         return
-    await message.answer(await admin_stats_text(), reply_markup=admin_panel_keyboard())
+    text, markup = await admin_channels_text()
+    await message.answer(text, reply_markup=markup)
 
 
 @router.callback_query(F.data == "admin:back")
@@ -1536,7 +1520,8 @@ async def handle_admin_back(callback: CallbackQuery) -> None:
         return
     await callback.answer()
     if callback.message:
-        await callback.message.edit_text(await admin_stats_text(), reply_markup=admin_panel_keyboard())
+        text, markup = await admin_channels_text()
+        await callback.message.edit_text(text, reply_markup=markup)
 
 
 @router.callback_query(F.data == "admin:reset_stats")
