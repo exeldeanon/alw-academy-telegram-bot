@@ -599,6 +599,12 @@ class Database:
         await self.conn.execute("DELETE FROM settings WHERE key=?", (key,))
         await self.conn.commit()
 
+    async def is_paused(self) -> bool:
+        return (await self.get_setting("bot_paused") or "0") == "1"
+
+    async def set_paused(self, value: bool) -> None:
+        await self.set_setting("bot_paused", "1" if value else "0")
+
     async def waiting_for_checklist(self) -> list[int]:
         assert self.conn is not None
         async with self.conn.execute(
@@ -866,6 +872,8 @@ async def send_checklist(bot: Bot, user_id: int) -> None:
 async def followup_worker(bot: Bot, user_id: int, due_at: float, step: int = 1) -> None:
     try:
         await asyncio.sleep(max(0.0, due_at - datetime.now(timezone.utc).timestamp()))
+        while await db.is_paused():
+            await asyncio.sleep(60)
         text = await followup_text(step, user_id)
         if text is None:
             await db.mark_followup_sent(user_id)
@@ -986,6 +994,9 @@ async def run_broadcast(bot: Bot, source: Message) -> tuple[int, int]:
 
 @router.chat_join_request()
 async def handle_join_request(request: ChatJoinRequest, bot: Bot) -> None:
+    if await db.is_paused():
+        logger.warning("Bot paused; leaving join request pending for chat=%s", request.chat.id)
+        return
     user = request.from_user
     invite = getattr(request, "invite_link", None)
     invite_url = str(getattr(invite, "invite_link", "") or "")
@@ -1049,6 +1060,8 @@ async def start_questionnaire(bot: Bot, user: Any, state: FSMContext) -> None:
 @router.message(CommandStart(), F.chat.type == ChatType.PRIVATE)
 async def handle_start(message: Message, bot: Bot, state: FSMContext) -> None:
     assert message.from_user is not None
+    if await db.is_paused() and not is_admin(message):
+        return
     payload = start_payload(message.text)
     source = "deep_link" if payload else "direct"
     label = source_label_from_payload(payload)
@@ -1084,6 +1097,9 @@ async def handle_start(message: Message, bot: Bot, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("q1_"))
 async def handle_question_1(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    if await db.is_paused() and not is_admin_user(callback.from_user):
+        await callback.answer("Бот временно отключён")
+        return
     user = callback.from_user
     await db.record_button_click(user.id, callback.data or "q1_unknown")
     await notify_admin(
@@ -1114,6 +1130,9 @@ async def handle_question_1(callback: CallbackQuery, bot: Bot, state: FSMContext
 
 @router.callback_query(F.data.startswith("q2_"))
 async def handle_question_2(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+    if await db.is_paused() and not is_admin_user(callback.from_user):
+        await callback.answer("Бот временно отключён")
+        return
     user = callback.from_user
     await db.record_button_click(user.id, callback.data or "q2_unknown")
     await notify_admin(
@@ -1144,6 +1163,9 @@ async def handle_question_2(callback: CallbackQuery, bot: Bot, state: FSMContext
 
 @router.callback_query(F.data == "checklist_read")
 async def handle_checklist_read(callback: CallbackQuery, bot: Bot) -> None:
+    if await db.is_paused() and not is_admin_user(callback.from_user):
+        await callback.answer("Бот временно отключён")
+        return
     await db.record_button_click(callback.from_user.id, "checklist_read")
     await db.mark_checklist_read(callback.from_user.id)
     await notify_admin(
@@ -1156,6 +1178,9 @@ async def handle_checklist_read(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data == "followup_interest")
 async def handle_followup_interest(callback: CallbackQuery, bot: Bot) -> None:
+    if await db.is_paused() and not is_admin_user(callback.from_user):
+        await callback.answer("Бот временно отключён")
+        return
     await db.record_button_click(callback.from_user.id, "followup_interest")
     await notify_admin(
         bot,
@@ -1182,6 +1207,9 @@ async def handle_followup_interest(callback: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data == "get_lead_magnet")
 async def handle_legacy_lead_button(callback: CallbackQuery, bot: Bot, state: FSMContext) -> None:
     """Keep old welcome messages usable while users transition to the quiz."""
+    if await db.is_paused() and not is_admin_user(callback.from_user):
+        await callback.answer("Бот временно отключён")
+        return
     await db.record_button_click(callback.from_user.id, "get_lead_magnet")
     await notify_admin(
         bot,
@@ -1206,6 +1234,30 @@ async def handle_stats(message: Message) -> None:
         f"Нажали «Прочитал(а)»: <b>{read}</b>\n"
         f"Старый лид-магнит: <b>{leads}</b>",
     )
+
+
+@router.message(Command("pause"), F.chat.type == ChatType.PRIVATE)
+async def handle_pause(message: Message) -> None:
+    if not is_admin(message):
+        return
+    await db.set_paused(True)
+    await message.answer("⏸ Бот отключён. Заявки остаются на рассмотрении. Для запуска: /resume")
+
+
+@router.message(Command("resume"), F.chat.type == ChatType.PRIVATE)
+async def handle_resume(message: Message) -> None:
+    if not is_admin(message):
+        return
+    await db.set_paused(False)
+    await message.answer("▶️ Бот снова включён и принимает заявки.")
+
+
+@router.message(Command("bot_status"), F.chat.type == ChatType.PRIVATE)
+async def handle_bot_status(message: Message) -> None:
+    if not is_admin(message):
+        return
+    state = "⏸ отключён" if await db.is_paused() else "▶️ работает"
+    await message.answer(f"Статус бота: <b>{state}</b>")
 
 
 BUTTON_LABELS = {
