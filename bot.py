@@ -469,6 +469,15 @@ class Database:
             if since and str(row["occurred_at"] or "") < since:
                 continue
             relevant.append(row)
+        joined_user_ids = tuple(sorted(joined_users))
+        blocked_count = 0
+        if joined_user_ids:
+            placeholders = ",".join("?" for _ in joined_user_ids)
+            async with self.conn.execute(
+                f"SELECT COUNT(*) FROM users WHERE blocked=1 AND user_id IN ({placeholders})",
+                joined_user_ids,
+            ) as cursor:
+                blocked_count = int((await cursor.fetchone())[0] or 0)
         answered_users = {
             int(row["user_id"])
             for row in relevant
@@ -482,7 +491,49 @@ class Database:
             "answered": len(answered_users),
             "sent": sum(1 for row in relevant if row["event"] == "checklist_sent"),
             "read": sum(1 for row in relevant if row["event"] == "button_click" and row["label"] == "checklist_read"),
+            "blocked": blocked_count,
         }
+
+    async def channel_event_statistics(self, chat_id: str, since: str | None = None) -> list[tuple[str, int, int]]:
+        summary = await self.channel_summary(chat_id, since)
+        _ = summary  # keep the channel membership calculation in one place
+        assert self.conn is not None
+        async with self.conn.execute(
+            "SELECT user_id, event, label, payload, occurred_at FROM events ORDER BY id"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        joined_users: set[int] = set()
+        for row in rows:
+            if row["event"] != "join_request":
+                continue
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            if str(payload.get("chat_id") or "") == str(chat_id) and (not since or str(row["occurred_at"] or "") >= since):
+                if row["user_id"] is not None:
+                    joined_users.add(int(row["user_id"]))
+        counts: dict[str, set[int]] = {}
+        totals: dict[str, int] = {}
+        for row in rows:
+            if row["user_id"] is None or int(row["user_id"]) not in joined_users:
+                continue
+            if since and str(row["occurred_at"] or "") < since:
+                continue
+            key = str(row["event"])
+            totals[key] = totals.get(key, 0) + 1
+            counts.setdefault(key, set()).add(int(row["user_id"]))
+        return sorted(((event, total, len(counts[event])) for event, total in totals.items()), key=lambda item: item[1], reverse=True)
+
+    async def channel_recent_events(self, chat_id: str, limit: int = 20) -> list[aiosqlite.Row]:
+        assert self.conn is not None
+        async with self.conn.execute(
+            "SELECT e.*, u.username, u.first_name FROM events e LEFT JOIN users u ON u.user_id=e.user_id "
+            "WHERE e.user_id IN (SELECT DISTINCT j.user_id FROM events j WHERE j.event='join_request' "
+            "AND json_extract(j.payload, '$.chat_id')=?) ORDER BY e.id DESC LIMIT ?",
+            (str(chat_id), limit),
+        ) as cursor:
+            return await cursor.fetchall()
 
     async def channel_sources(self, chat_id: str, since: str | None = None) -> list[tuple[str, str, int, int]]:
         assert self.conn is not None
@@ -1418,6 +1469,7 @@ def admin_channel_keyboard(chat_id: str, days: int = 0) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📈 7д", callback_data=f"admin:channel:{chat_id}:7"),
         ],
         [InlineKeyboardButton(text="🗓 30д", callback_data=f"admin:channel:{chat_id}:30")],
+        [InlineKeyboardButton(text="🛰 Последние события", callback_data=f"admin:channel_events:{chat_id}")],
         [InlineKeyboardButton(text="🔗 Источники этого канала", callback_data=f"admin:csources:{chat_id}")],
         [InlineKeyboardButton(text="📡 Другой канал", callback_data="admin:channels")],
         [InlineKeyboardButton(text="⬅️ В общую панель", callback_data="admin:back")],
@@ -1461,8 +1513,33 @@ async def admin_channel_stats_text(chat_id: str, days: int = 0) -> str:
         f"🧩 Завершили анкету: <b>{summary['answered']}</b>",
         f"📖 Получили материал: <b>{summary['sent']}</b>",
         f"✅ Отметили материал: <b>{summary['read']}</b>",
+        f"⛔ Заблокировали бота: <b>{summary['blocked']}</b>",
         f"🛰 События: <b>{summary['events']}</b>",
+        "",
+        "<b>События канала:</b>",
     ]
+    event_rows = await db.channel_event_statistics(chat_id, since)
+    if event_rows:
+        for event, total, users in event_rows[:12]:
+            lines.append(f"• {html.escape(EVENT_LABELS.get(event, event))}: <b>{total}</b> · людей <b>{users}</b>")
+    else:
+        lines.append("Пока событий нет.")
+    return "\n".join(lines)
+
+
+async def admin_channel_events_text(chat_id: str) -> str:
+    channel = next((item for item in await db.channel_catalog() if str(item["chat_id"]) == str(chat_id)), None)
+    title = html.escape(channel_display_name(channel) if channel else chat_id)
+    lines = [f"🛰 <b>Последние события · {title}</b>", ""]
+    rows = await db.channel_recent_events(chat_id, 30)
+    if not rows:
+        lines.append("Событий пока нет.")
+    for row in rows:
+        stamp = html.escape(str(row["occurred_at"])[5:19].replace("T", " "))
+        user = event_user_label(row) if row["user_id"] else "система"
+        event = html.escape(EVENT_LABELS.get(row["event"], row["event"]))
+        label = html.escape(str(row["label"] or ""))
+        lines.append(f"<code>{stamp}</code> · {user}\n└ {event}{(' · ' + label) if label else ''}")
     return "\n".join(lines)
 
 
@@ -1592,6 +1669,20 @@ async def handle_admin_channel(callback: CallbackQuery) -> None:
             await admin_channel_stats_text(chat_id, days),
             reply_markup=admin_channel_keyboard(chat_id, days),
         )
+
+
+@router.callback_query(F.data.startswith("admin:channel_events:"))
+async def handle_admin_channel_events(callback: CallbackQuery) -> None:
+    if not is_admin_user(callback.from_user):
+        return
+    chat_id = (callback.data or "").split(":", 2)[-1]
+    await callback.answer()
+    if callback.message:
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ К статистике канала", callback_data=f"admin:channel:{chat_id}:0")],
+            [InlineKeyboardButton(text="📡 Другой канал", callback_data="admin:channels")],
+        ])
+        await callback.message.edit_text(await admin_channel_events_text(chat_id), reply_markup=markup)
 
 
 @router.callback_query(F.data.startswith("admin:csources:"))
